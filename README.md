@@ -1,13 +1,360 @@
-# SSR Cache with ETag and Cache-Control
+# SSR Cache Demo: ETag, Cache-Control и SWR в Nuxt 3
 
-This repository demonstrates how to implement **Server-Side Rendering (SSR)** caching using **Node.js** as the backend and **Nuxt 3** as the frontend.
+Демонстрационный проект, в котором разобраны три подхода к кэшированию при серверном рендеринге (SSR). Бэкенд — чистый Node.js HTTP-сервер, фронтенд — Nuxt 3.
 
-## Core Ideas
+---
 
-1. **[Works only with SSR]**: Based on `nuxt.config.js`. We can use `swr` routeRules in order to periodically fetch and update cached HTML in the background.
-2. **[Works only with SPA (SSR ignores any headers set by server)]**: Based on manual `Cache-Control`, `ETag` and optional `stale-while-revalidate` headers on the backend server.
-   - The **Node.js server** generates dynamic content and controls HTTP caching via `ETag` and `Cache-Control` headers.
-   - **ETag** ensures that the client can check if the content has changed without refetching it.
-   - **Cache-Control** with `max-age` and `stale-while-revalidate` allows the client to serve cached content while asynchronously checking for updates.
-   - The **Nuxt 3 client** uses `useAsyncData` to fetch data during SSR and handle HTTP caching to avoid unnecessary server requests and reduce load.
-3. **[Works only with SSR]**. Based on global server middleware. We "intercept" source request and using custom storage with TTL (Redis / Memcache / Unstorage) initiate or not HTTP request and cache it.
+## Содержание
+
+- [Мотивация](#мотивация)
+- [Архитектура проекта](#архитектура-проекта)
+- [Три стратегии кэширования](#три-стратегии-кэширования)
+  - [Стратегия 1 — SWR через routeRules (SSR)](#стратегия-1--swr-через-routerules-ssr)
+  - [Стратегия 2 — ETag + Cache-Control (SPA)](#стратегия-2--etag--cache-control-spa)
+  - [Стратегия 3 — серверный middleware с TTL-хранилищем (SSR)](#стратегия-3--серверный-middleware-с-ttl-хранилищем-ssr)
+- [Детали реализации](#детали-реализации)
+  - [Backend: Node.js HTTP-сервер](#backend-nodejs-http-сервер)
+  - [Frontend: Nuxt 3](#frontend-nuxt-3)
+- [Запуск](#запуск)
+- [Структура файлов](#структура-файлов)
+- [Полезные ссылки](#полезные-ссылки)
+
+---
+
+## Мотивация
+
+При использовании SSR каждый запрос пользователя приводит к полному рендерингу страницы на сервере. Если контент обновляется нечасто (раз в 10–60 секунд), бессмысленно рендерить страницу заново при каждом запросе — это лишняя нагрузка на сервер и увеличенное время ответа.
+
+Кэширование позволяет:
+- отдавать уже отрендеренный HTML из кэша, минуя повторный рендер;
+- снизить нагрузку на бэкенд (меньше обращений к API/БД);
+- ускорить Time To First Byte (TTFB) для конечного пользователя;
+- при необходимости — «мягко» обновлять кэш в фоне (`stale-while-revalidate`).
+
+Данный репозиторий показывает, как каждая из трёх стратегий работает на практике, с какими ограничениями сталкивается и в каких сценариях применима.
+
+---
+
+## Архитектура проекта
+
+```
+┌────────────────────┐         HTTP          ┌────────────────────┐
+│                    │  GET /content          │                    │
+│    Nuxt 3 App      │ ────────────────────►  │  Node.js Backend   │
+│   (SSR / SPA)      │                        │  (порт 3000)       │
+│   порт 3001        │  ◄────────────────────  │                    │
+│                    │  HTML + Cache headers  │                    │
+└────────────────────┘                        └────────────────────┘
+```
+
+- **Backend** (`backend/`) — генерирует динамический контент, выставляет HTTP-заголовки кэширования (`ETag`, `Cache-Control`), имитирует медленный ответ (3 сек. задержка).
+- **Frontend** (`frontend/`) — Nuxt 3 приложение, которое запрашивает данные с бэкенда через `useAsyncData` + `$fetch` и отображает их.
+
+---
+
+## Три стратегии кэширования
+
+### Стратегия 1 — SWR через `routeRules` (SSR)
+
+> Работает **только в SSR-режиме**.
+
+Nuxt 3 из коробки поддерживает ISR/SWR (Incremental Static Regeneration / Stale-While-Revalidate) на уровне маршрутов. Конфигурируется в `nuxt.config.ts`:
+
+```ts
+export default defineNuxtConfig({
+  routeRules: {
+    "/": {
+      swr: 5 // TTL кэша в секундах
+    }
+  }
+})
+```
+
+**Как это работает:**
+
+1. Первый запрос к маршруту `/` — Nuxt выполняет полный SSR-рендер, сохраняет HTML-результат в кэш и отдаёт его клиенту.
+2. В течение 5 секунд все последующие запросы обслуживаются из кэша мгновенно, без рендера.
+3. После истечения TTL (5 сек.) следующий запрос всё ещё получает «старый» HTML из кэша, но **в фоне** Nuxt запускает повторный рендер и обновляет кэш.
+4. Все последующие запросы уже получают обновлённый HTML.
+
+**Плюсы:**
+- Нулевая конфигурация — одна строка в `nuxt.config.ts`.
+- Nitro (серверный движок Nuxt) управляет кэшем автоматически.
+- Пользователь никогда не ждёт рендер (кроме самого первого запроса).
+
+**Ограничения:**
+- Работает исключительно на стороне Nuxt-сервера. Бэкенд о кэшировании ничего не знает.
+- Нет гранулярного контроля инвалидации — только по TTL.
+
+---
+
+### Стратегия 2 — ETag + Cache-Control (SPA)
+
+> Работает **только в SPA-режиме**. При SSR Nuxt игнорирует заголовки кэширования, выставленные бэкендом.
+
+Кэширование управляется HTTP-заголовками на стороне Node.js-бэкенда.
+
+**Используемые заголовки:**
+
+| Заголовок | Значение | Назначение |
+|---|---|---|
+| `Cache-Control` | `public, max-age=60, stale-while-revalidate=10` | Разрешает кэширование на 60 сек.; после истечения — ещё 10 сек. отдаёт устаревший ответ, обновляя кэш в фоне |
+| `ETag` | MD5-хеш текущего контента | Идентификатор версии ответа для условных запросов |
+
+**Жизненный цикл запроса:**
+
+```
+Клиент                         Сервер
+  │                               │
+  │  GET /content                 │
+  │ ─────────────────────────────►│
+  │                               │  (генерация контента, 3 сек.)
+  │  200 OK                       │
+  │  ETag: "abc123"               │
+  │  Cache-Control: max-age=60    │
+  │ ◄─────────────────────────────│
+  │                               │
+  │  ... проходит < 60 сек. ...   │
+  │  GET /content                 │
+  │  (ответ из кэша браузера)     │
+  │                               │
+  │  ... проходит > 60 сек. ...   │
+  │  GET /content                 │
+  │  If-None-Match: "abc123"      │
+  │ ─────────────────────────────►│
+  │                               │  (контент не изменился)
+  │  304 Not Modified             │
+  │ ◄─────────────────────────────│
+```
+
+**Механизм обновления контента на бэкенде:**
+
+Каждые 30 секунд бэкенд генерирует новое случайное значение и пересчитывает ETag:
+
+```js
+setInterval(() => {
+  randomValue = generateRandomValue()
+  etag = invalidateETag(randomValue)
+}, 30_000)
+```
+
+Если клиент присылает `If-None-Match` с текущим ETag — сервер отвечает `304 Not Modified` (без тела, мгновенно). Если ETag не совпадает — сервер отдаёт полный ответ с новыми данными.
+
+**Плюсы:**
+- Полный контроль над кэшированием на стороне бэкенда.
+- `304 Not Modified` — экономия трафика и времени при неизменённых данных.
+- `stale-while-revalidate` — пользователь не видит задержку при ревалидации.
+
+**Ограничения:**
+- Не работает с SSR (Nuxt при SSR не прокидывает заголовки ответа бэкенда в ответ клиенту).
+- Кэширование зависит от поведения браузера — у каждого свои нюансы реализации `Cache-Control`.
+
+---
+
+### Стратегия 3 — серверный middleware с TTL-хранилищем (SSR)
+
+> Работает **только в SSR-режиме**.
+
+Суть: на уровне Nuxt-сервера добавляется middleware, который перехватывает входящие запросы. Перед выполнением полного SSR-рендера middleware проверяет наличие закэшированного HTML в хранилище (Redis, Memcached, Unstorage и т.д.). Если запись есть и не протухла — отдаёт её напрямую, минуя рендер.
+
+В текущей реализации middleware является заглушкой (`cache.middleware.ts`):
+
+```ts
+export default defineNuxtRouteMiddleware(() => {
+  // ...
+})
+```
+
+Предполагаемая полная реализация выглядела бы примерно так:
+
+```ts
+import { useStorage } from '#imports'
+
+export default defineEventHandler(async (event) => {
+  const url = getRequestURL(event).pathname
+  const storage = useStorage('cache')
+
+  const cached = await storage.getItem(url)
+  if (cached) {
+    return cached // отдаём из кэша, рендер не выполняется
+  }
+
+  // если кэша нет — рендер выполнится штатно,
+  // а результат можно перехватить и сохранить в storage
+})
+```
+
+**Плюсы:**
+- Полный контроль: можно кэшировать выборочно (по URL, по query-параметрам, по заголовкам).
+- Возможность инвалидировать кэш программно (по webhook, по событию и т.д.).
+- Хранилище может быть внешним (Redis), что позволяет разделять кэш между инстансами.
+
+**Ограничения:**
+- Необходимо самостоятельно реализовать логику записи/чтения/инвалидации.
+- Нужна инфраструктура для хранилища (Redis, Memcached).
+
+---
+
+## Детали реализации
+
+### Backend: Node.js HTTP-сервер
+
+**Файл:** `backend/server.js`
+
+Минимальный HTTP-сервер без фреймворков (`http` модуль из стандартной библиотеки).
+
+| Аспект | Описание |
+|---|---|
+| Порт | `3000` |
+| Endpoint | `GET /content` |
+| Задержка ответа | 3 секунды (имитация тяжёлой операции) |
+| Обновление контента | Каждые 30 сек. генерируется новый `randomValue` |
+| ETag | MD5-хеш от `randomValue` |
+| CORS | Включён для всех источников (`Access-Control-Allow-Origin: *`) |
+
+**Обработка запроса `GET /content`:**
+
+1. Проверяется заголовок `If-None-Match`. Если совпадает с текущим `etag` — ответ `304`.
+2. Иначе — ожидание 3 сек. (симуляция), затем ответ `200` с HTML-контентом, заголовками `Cache-Control` и `ETag`.
+
+**Генерация ETag:**
+
+```js
+const invalidateETag = (randomValue) =>
+  crypto.createHash('md5').update(JSON.stringify(randomValue)).digest('hex')
+```
+
+Используется MD5 от строкового представления числа. В продакшене в качестве ETag обычно берут хеш от полного тела ответа или его версионный идентификатор.
+
+---
+
+### Frontend: Nuxt 3
+
+**Файл:** `frontend/app.vue`
+
+Компонент использует `useAsyncData` для получения данных с бэкенда:
+
+```vue
+<script setup lang="ts">
+const { data, refresh, status } = await useAsyncData(
+  'mountains',
+  () => $fetch('http://localhost:3000/content'),
+)
+</script>
+```
+
+- `useAsyncData` выполняет запрос и на сервере (при SSR), и на клиенте (при навигации).
+- `$fetch` — обёртка над `ofetch` от unjs. При SSR выполняет запрос напрямую (server-to-server), при SPA — из браузера.
+- `refresh()` — ручной повторный запрос данных (привязан к кнопке в UI).
+- `status` — реактивная переменная со статусом запроса (`idle`, `pending`, `success`, `error`).
+
+**Конфигурация Nuxt** (`frontend/nuxt.config.ts`):
+
+```ts
+export default defineNuxtConfig({
+  compatibilityDate: '2024-04-03',
+  devtools: { enabled: true },
+  routeRules: {
+    "/": { swr: 5 }
+  }
+})
+```
+
+`swr: 5` — включает SWR-кэширование для маршрута `/` с TTL 5 секунд (стратегия 1).
+
+---
+
+## Запуск
+
+### Требования
+
+- Node.js >= 18
+- npm
+
+### Backend
+
+```bash
+cd backend
+node server.js
+```
+
+Сервер стартует на `http://localhost:3000`.
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Nuxt dev-сервер стартует на `http://localhost:3001` (или другом свободном порту).
+
+### Порядок запуска
+
+1. Сначала запустить бэкенд — фронтенд обращается к нему при рендере.
+2. Затем запустить фронтенд.
+3. Открыть `http://localhost:3001` в браузере.
+
+### Сборка для продакшена
+
+```bash
+cd frontend
+npm run build
+npm run preview
+```
+
+`npm run preview` поднимет Nitro-сервер с production-сборкой.
+
+---
+
+## Структура файлов
+
+```
+SSR-cache-demo/
+├── backend/
+│   ├── package.json              # Метаданные бэкенд-пакета
+│   └── server.js                 # HTTP-сервер с ETag и Cache-Control
+│
+├── frontend/
+│   ├── app.vue                   # Корневой компонент (useAsyncData + $fetch)
+│   ├── middleware/
+│   │   └── cache.middleware.ts   # Заглушка для серверного кэширующего middleware
+│   ├── server/
+│   │   └── tsconfig.json         # TS-конфиг серверной части Nuxt
+│   ├── public/
+│   │   ├── favicon.ico
+│   │   └── robots.txt
+│   ├── nuxt.config.ts            # Конфигурация Nuxt (routeRules с SWR)
+│   ├── package.json              # Зависимости фронтенда (nuxt, vue, vue-router)
+│   ├── tsconfig.json             # TS-конфиг проекта
+│   └── .editorconfig             # Настройки форматирования
+│
+├── .gitignore
+└── README.md                     # Этот файл
+```
+
+---
+
+## Сравнительная таблица стратегий
+
+| Критерий | SWR routeRules | ETag + Cache-Control | Server Middleware + Storage |
+|---|---|---|---|
+| Режим работы | SSR | SPA | SSR |
+| Где хранится кэш | Nitro (in-memory) | Браузер клиента | Redis / Memcached / Unstorage |
+| Гранулярность | По маршруту | По endpoint | Произвольная |
+| Инвалидация | По TTL | По ETag | Программная / по TTL |
+| Сложность настройки | Минимальная | Средняя | Высокая |
+| Масштабируемость | Один инстанс | Каждый клиент отдельно | Несколько инстансов (shared cache) |
+
+---
+
+## Полезные ссылки
+
+- [Nuxt 3 — Route Rules](https://nuxt.com/docs/guide/concepts/rendering#route-rules)
+- [Nuxt 3 — useAsyncData](https://nuxt.com/docs/api/composables/use-async-data)
+- [MDN — Cache-Control](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control)
+- [MDN — ETag](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag)
+- [MDN — stale-while-revalidate](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control#stale-while-revalidate)
+- [HTTP Caching — web.dev](https://web.dev/articles/http-cache)
+- [Nitro — Storage Layer](https://nitro.unjs.io/guide/storage)
